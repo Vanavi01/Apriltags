@@ -1,12 +1,17 @@
 '''
 Autopark: a LEGO Education Double Motor car with an AprilTag (tag36h11, ID 14)
-mounted on it drives itself in front of a stationary laptop webcam. OpenCV's
-built-in AprilTag detector (cv2.aruco, family 36h11 - the same family used by
+mounted on it parallel-parks itself in front of a stationary laptop webcam.
+The car sits broadside to the webcam and only ever drives straight forward or
+backward - because of that orientation, straight driving is exactly what
+appears as left/right motion on screen (like a car sliding along a curb), so
+there's no turning involved anywhere in this control loop.
+
+OpenCV's built-in AprilTag detector (cv2.aruco, family 36h11 - the same
+family used by
 https://ftc-docs.firstinspires.org/.../AprilTag_0-20_family36h11.pdf) finds
-the tag every frame; its image position and apparent size are used to steer
-and to judge distance, closing the loop over the same BLE link drive.py in
-the ceciLego project uses (lelib.py is vendored here the same way it is
-there - see README).
+the tag every frame; only its horizontal image position is used as feedback.
+Motor control goes over the same BLE link drive.py in the ceciLego project
+uses (lelib.py is vendored here the same way it is there - see README).
 
 Usage:
     python autopark.py
@@ -27,20 +32,17 @@ TARGET_TAG_ID = 14
 RIGHT_FLIP = -1
 LEFT_FLIP = 1
 
-# Whether "tag left of center in the image" means "speed up the left wheel"
-# or the right one depends on which way the tag faces the webcam, and isn't
-# something you can derive from a single 2D corner set - flip this to -1 if
-# the car steers away from center instead of toward it (same idea as
-# ceciLego's SWAP_HANDS).
-STEER_SIGN = 1
+# Whether "tag right of image-center" means "drive forward" or "drive
+# backward" depends on which end of the car is facing which way when it's
+# set on the table broadside to the webcam - flip this to -1 if the car
+# drives away from center instead of toward it (same idea as ceciLego's
+# SWAP_HANDS).
+DRIVE_SIGN = 1
 
 MAX_SPEED = 50          # -100..100, kept modest for a maneuver that ends close to the laptop
-TURN_GAIN = 0.15        # motor-speed units per pixel of horizontal offset
-DIST_GAIN = 0.35        # motor-speed units per pixel of tag-size error
+DRIVE_GAIN = 0.25       # motor-speed units per pixel of horizontal offset
 
-TARGET_SIDE_PX = 220    # apparent tag side length (px) that counts as "parked"
 CENTER_TOLERANCE_PX = 20
-SIZE_TOLERANCE_PX = 15
 HOLD_FRAMES = 5          # consecutive in-tolerance frames before declaring parked
 LOST_TIMEOUT = 1.5       # seconds with no tag seen before the car is stopped as a failsafe
 SEND_INTERVAL = 0.1      # BLE write throttle, same reasoning as ceciLego/motor.py
@@ -51,7 +53,10 @@ def clamp(v, lo, hi):
 
 
 def tag_metrics(corners):
-    """corners: (4,2) array, detector order. Returns (centroid_xy, side_length_px)."""
+    """corners: (4,2) array, detector order. Returns (centroid_xy, side_length_px).
+    side_px isn't used for control (the car can't change its distance from
+    the webcam by driving along its own parking line) - it's shown on screen
+    purely as a sanity readout."""
     centroid = corners.mean(axis=0)
     side_px = np.mean([np.linalg.norm(corners[i] - corners[(i + 1) % 4]) for i in range(4)])
     return centroid, side_px
@@ -71,14 +76,14 @@ class ParkMotor:
         self.dm.connect(card_serial=self.card_serial)
         print("Connected.")
 
-    def send(self, left, right, now):
-        left, right = int(left), int(right)
-        if now - self._last_send > SEND_INTERVAL and (left, right) != self._last_cmd:
-            self.dm.set_speed_left(LEFT_FLIP * left)
-            self.dm.set_speed_right(RIGHT_FLIP * right)
+    def send(self, speed, now):
+        speed = int(speed)
+        if now - self._last_send > SEND_INTERVAL and speed != self._last_cmd:
+            self.dm.set_speed_left(LEFT_FLIP * speed)
+            self.dm.set_speed_right(RIGHT_FLIP * speed)
             self.dm.run_left()
             self.dm.run_right()
-            self._last_send, self._last_cmd = now, (left, right)
+            self._last_send, self._last_cmd = now, speed
 
     def stop(self):
         self.dm.stop()
@@ -133,30 +138,22 @@ try:
             cv2.polylines(frame, [target_corners.astype(int)], isClosed=True,
                           color=(0, 0, 255), thickness=2)
             cv2.circle(frame, (int(centroid[0]), int(centroid[1])), 4, (0, 0, 255), -1)
-            cv2.putText(frame, f"({centroid[0]:.0f}, {centroid[1]:.0f})",
+            cv2.putText(frame, f"({centroid[0]:.0f}, {centroid[1]:.0f})  size={side_px:.0f}px",
                         (int(centroid[0]) + 10, int(centroid[1])),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
             x_error = centroid[0] - center_x
-            size_error = TARGET_SIDE_PX - side_px
 
-            in_tolerance = abs(x_error) < CENTER_TOLERANCE_PX and abs(size_error) < SIZE_TOLERANCE_PX
+            in_tolerance = abs(x_error) < CENTER_TOLERANCE_PX
             tolerance_streak = tolerance_streak + 1 if in_tolerance else 0
             if tolerance_streak >= HOLD_FRAMES:
                 parked = True
 
-            if parked:
-                left_speed = right_speed = 0
-            else:
-                forward = clamp(DIST_GAIN * size_error, -MAX_SPEED, MAX_SPEED)
-                turn = clamp(TURN_GAIN * x_error, -MAX_SPEED, MAX_SPEED) * STEER_SIGN
-                left_speed = clamp(forward - turn, -MAX_SPEED, MAX_SPEED)
-                right_speed = clamp(forward + turn, -MAX_SPEED, MAX_SPEED)
-
-            car.send(left_speed, right_speed, now)
+            speed = 0 if parked else clamp(DRIVE_GAIN * x_error * DRIVE_SIGN, -MAX_SPEED, MAX_SPEED)
+            car.send(speed, now)
 
         if now - last_seen > LOST_TIMEOUT:
-            car.send(0, 0, now)
+            car.send(0, now)
             parked = False
             tolerance_streak = 0
 
