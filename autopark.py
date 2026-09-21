@@ -23,7 +23,7 @@ import numpy as np
 
 from lelib import doubleMotor
 
-CARD_SERIAL = "0999"                       # same Double Motor as the ceciLego gesture car
+CARD_SERIAL = "1130"                       # same Double Motor as the ceciLego gesture car
 TAG_FAMILY = cv2.aruco.DICT_APRILTAG_36h11
 TARGET_TAG_ID = 14
 
