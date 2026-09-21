@@ -1,20 +1,22 @@
 '''
-Autopark: a LEGO Education Double Motor car with an AprilTag (tag36h11, ID 14)
-mounted on it parallel-parks itself in front of a stationary laptop webcam.
-The car sits broadside to the webcam and only ever drives straight forward or
-backward - because of that orientation, straight driving is exactly what
-appears as left/right motion on screen (like a car sliding along a curb), so
-there's no turning involved anywhere in this control loop.
+iPhone autopark: same closed-loop parking control as autopark.py, but reads
+frames from an iPhone's MJPEG stream (IP Camera Lite) instead of a local
+webcam - the car drives itself using a fixed AprilTag (tag36h11, ID 14) as
+its landmark instead of carrying the tag itself.
 
-OpenCV's built-in AprilTag detector (cv2.aruco, family 36h11 - the same
-family used by
-https://ftc-docs.firstinspires.org/.../AprilTag_0-20_family36h11.pdf) finds
-the tag every frame; only its horizontal image position is used as feedback.
-Motor control goes over the same BLE link drive.py in the ceciLego project
-uses (lelib.py is vendored here the same way it is there - see README).
+The tag is stationary somewhere in the room; the iPhone is mounted on the
+car, broadside to the tag, same physical relationship autopark.py relies on
+(the car's drive axis parallel to the tag's line of sight) - only which end
+carries the camera and which carries the tag is swapped. That means the
+control math is identical: the car can't turn, so the only thing driving
+forward/backward changes is the tag's horizontal position in frame, and
+that's the only feedback signal needed.
 
 Usage:
-    python autopark.py
+    python iphone_autopark.py
+
+You'll be prompted for the MJPEG stream URL (see iphone_tracking.py for how
+to find it), e.g. http://admin:admin@10.243.97.67:8081/video
 '''
 import time
 
@@ -23,29 +25,29 @@ import numpy as np
 
 from lelib import doubleMotor
 
-CARD_SERIAL = "1130"                       # same Double Motor as the ceciLego gesture car
+CARD_SERIAL = "0999"                       # same Double Motor as autopark.py
 TAG_FAMILY = cv2.aruco.DICT_APRILTAG_36h11
 TARGET_TAG_ID = 14
 
-# The two motors are mounted mirrored on this chassis (see ceciLego/CLAUDE.md) -
-# same correction, same car.
+# The two motors are mounted mirrored on this chassis - same correction, same car.
 RIGHT_FLIP = -1
 LEFT_FLIP = 1
 
 # Whether "tag right of image-center" means "drive forward" or "drive
-# backward" depends on which end of the car is facing which way when it's
-# set on the table broadside to the webcam - flip this to -1 if the car
-# drives away from center instead of toward it (same idea as ceciLego's
-# SWAP_HANDS).
+# backward" depends on which end of the car is facing which way once it's
+# set down broadside to the tag - flip this to -1 if the car drives away
+# from center instead of toward it.
 DRIVE_SIGN = 1
 
-MAX_SPEED = 50          # -100..100, kept modest for a maneuver that ends close to the laptop
+MAX_SPEED = 50          # -100..100, kept modest for a maneuver that ends close to the tag
 DRIVE_GAIN = 0.25       # motor-speed units per pixel of horizontal offset
 
 CENTER_TOLERANCE_PX = 20
 HOLD_FRAMES = 5          # consecutive in-tolerance frames before declaring parked
 LOST_TIMEOUT = 1.5       # seconds with no tag seen before the car is stopped as a failsafe
-SEND_INTERVAL = 0.1      # BLE write throttle, same reasoning as ceciLego/motor.py
+SEND_INTERVAL = 0.1      # BLE write throttle
+
+MAX_CONSECUTIVE_READ_FAILURES = 30     # ~1s of dropped frames over Wi-Fi before giving up
 
 
 def clamp(v, lo, hi):
@@ -54,16 +56,14 @@ def clamp(v, lo, hi):
 
 def tag_metrics(corners):
     """corners: (4,2) array, detector order. Returns (centroid_xy, side_length_px).
-    side_px isn't used for control (the car can't change its distance from
-    the webcam by driving along its own parking line) - it's shown on screen
-    purely as a sanity readout."""
+    side_px isn't used for control - it's shown on screen purely as a sanity readout."""
     centroid = corners.mean(axis=0)
     side_px = np.mean([np.linalg.norm(corners[i] - corners[(i + 1) % 4]) for i in range(4)])
     return centroid, side_px
 
 
 class ParkMotor:
-    '''Throttled, deduped BLE speed sends - same pattern as ceciLego/motor.py.'''
+    '''Throttled, deduped BLE speed sends - same pattern as autopark.py.'''
 
     def __init__(self, card_serial):
         self.card_serial = card_serial
@@ -92,14 +92,8 @@ class ParkMotor:
         self.dm.disconnect()
 
 
-cams = []
-for i in range(2):
-    c = cv2.VideoCapture(i)
-    if c.isOpened():
-        cams.append(i)
-        c.release()
-print("Available cameras:", cams)
-cap = cv2.VideoCapture(int(input("Which camera index? ")))
+stream_url = input("iPhone stream URL (e.g. http://admin:admin@10.243.97.67:8081/video): ").strip()
+cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
 
 aruco_dict = cv2.aruco.getPredefinedDictionary(TAG_FAMILY)
 detector = cv2.aruco.ArucoDetector(aruco_dict, cv2.aruco.DetectorParameters())
@@ -110,12 +104,21 @@ car.connect()
 last_seen = time.time()
 tolerance_streak = 0
 parked = False
+consecutive_failures = 0
 
 try:
     while True:
         ok, frame = cap.read()
         if not ok:
-            break
+            # A Wi-Fi stream drops frames now and then; tolerate brief drops and
+            # only give up if they don't stop (autopark.py's wired webcam never
+            # needed this - a dropped read there is fatal).
+            consecutive_failures += 1
+            if consecutive_failures > MAX_CONSECUTIVE_READ_FAILURES:
+                print("Lost the stream - too many consecutive failed reads.")
+                break
+            continue
+        consecutive_failures = 0
 
         now = time.time()
         h, w, _ = frame.shape
@@ -160,7 +163,7 @@ try:
         status = "PARKED" if parked else ("TRACKING" if target_corners is not None else "NO TAG")
         cv2.putText(frame, status, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
 
-        cv2.imshow("Autopark - press q to quit", frame)
+        cv2.imshow("iPhone autopark - press q to quit", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 finally:
