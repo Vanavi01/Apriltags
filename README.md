@@ -128,6 +128,35 @@ real-world offset covers far fewer pixels in the cropped view, so
 `autopark.py`'s original gain would saturate to full speed almost
 immediately.
 
+### The control policy
+
+`iphone_autopark.py`'s policy is a memoryless proportional (P) controller on
+a single scalar observation, `x_error` - no integral/derivative term, no
+learning, no state estimation:
+
+```python
+speed = clamp(DRIVE_GAIN * x_error * DRIVE_SIGN, -MAX_SPEED, MAX_SPEED)
+```
+
+`DRIVE_SIGN` is an empirically-set polarity flip (not derived from
+geometry), and `clamp(...)` is what made the car "take off" earlier when
+`DRIVE_GAIN` was tuned too high - almost any offset saturated straight to
+`MAX_SPEED`, turning the proportional controller into an effectively
+bang-bang one.
+
+Two discrete overrides sit on top of that continuous law:
+
+- **Parked latch** - once `x_error` stays within `CENTER_TOLERANCE_PX` for
+  `HOLD_FRAMES` consecutive frames, `speed` is forced to `0` and stays that
+  way even if the tag later drifts back out of tolerance. This is the only
+  memory anywhere in the policy.
+- **Lost-tag failsafe** - if the tag isn't seen for `LOST_TIMEOUT`, `speed`
+  is forced to `0` and both the latch and tolerance streak reset.
+
+Whatever speed results is sent identically to both wheels (no differential
+steering) through `ParkMotor.send()`, which is a separate BLE throttling/
+dedup layer, not part of the decision logic itself.
+
 ### Known issues
 
 - Frame rate visibly drops once the tag is detected and the car starts
