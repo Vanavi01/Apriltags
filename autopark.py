@@ -23,7 +23,7 @@ import numpy as np
 
 from lelib import doubleMotor
 
-CARD_SERIAL = "0999"                       # same Double Motor as the ceciLego gesture car
+CARD_SERIAL = "1130"                       # same Double Motor as the ceciLego gesture car
 TAG_FAMILY = cv2.aruco.DICT_APRILTAG_36h11
 TARGET_TAG_ID = 14
 
@@ -39,17 +39,39 @@ LEFT_FLIP = 1
 # SWAP_HANDS).
 DRIVE_SIGN = 1
 
-MAX_SPEED = 50          # -100..100, kept modest for a maneuver that ends close to the laptop
-DRIVE_GAIN = 0.25       # motor-speed units per pixel of horizontal offset
+MAX_SPEED = 20          # -100..100, lowered further so the car stays slow enough for the
+                        # webcam's framerate to keep up - it no longer stops on a single missed
+                        # frame (see the tracking loop below), so speed has to be conservative
+                        # enough that misses are rare in the first place, not just short-lived
+DRIVE_GAIN = 0.15       # motor-speed units per pixel of horizontal offset - proportional-only
+                        # (no integral/derivative term), same shape as the original controller.
+                        # Real BLE/motor latency means it still overshoots center slightly before
+                        # correcting back, without the full-speed-to-the-line violence of a
+                        # bang-bang controller.
 
-CENTER_TOLERANCE_PX = 20
+CENTER_TOLERANCE_PX = 20            # error band that counts as "centered" for parking
+RECALIBRATE_TOLERANCE_PX = 40       # wider than CENTER_TOLERANCE_PX (hysteresis) - how far the
+                                     # tag has to drift once parked before the car re-approaches
 HOLD_FRAMES = 5          # consecutive in-tolerance frames before declaring parked
-LOST_TIMEOUT = 1.5       # seconds with no tag seen before the car is stopped as a failsafe
+DRIFT_HOLD_FRAMES = 5    # consecutive frames past RECALIBRATE_TOLERANCE_PX, while parked,
+                         # before giving up "parked" and driving back to center
+LOST_TIMEOUT = 1.5       # seconds with no tag seen before parked/streak state resets and a
+                         # search sweep starts (see SEARCH_SPEED below)
+SEARCH_SPEED = 10        # slow, deliberate speed while blind-sweeping for a lost tag
+SEARCH_LEG_SECONDS = 1.5 # how long to drive each direction before reversing, so the sweep stays
+                         # within a bounded patch of desk instead of driving off the edge
 SEND_INTERVAL = 0.1      # BLE write throttle, same reasoning as ceciLego/motor.py
 
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
+
+
+def pid_speed(x_error):
+    '''Proportional speed toward the tag, clamped to MAX_SPEED - the original controller
+    shape. No slow-down zone, so it still overshoots center a little before correcting back,
+    but it decelerates as the error shrinks instead of driving at full speed to the line.'''
+    return clamp(DRIVE_GAIN * x_error * DRIVE_SIGN, -MAX_SPEED, MAX_SPEED)
 
 
 def tag_metrics(corners):
@@ -109,7 +131,15 @@ car.connect()
 
 last_seen = time.time()
 tolerance_streak = 0
+drift_streak = 0
 parked = False
+ever_seen = False        # whether the tag has ever been acquired - gates the search sweep so
+                         # the car doesn't go blind-searching before it's found the tag once
+last_direction = 1       # sign of the most recent x_error, used to pick which way to start
+                         # sweeping when the tag is lost (continue the way it was last heading)
+searching = False
+search_dir = 1
+search_leg_start = 0.0
 
 try:
     while True:
@@ -133,6 +163,8 @@ try:
 
         if target_corners is not None:
             last_seen = now
+            ever_seen = True
+            searching = False
             centroid, side_px = tag_metrics(target_corners)
 
             cv2.polylines(frame, [target_corners.astype(int)], isClosed=True,
@@ -143,21 +175,64 @@ try:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
             x_error = centroid[0] - center_x
-
+            last_direction = 1 if x_error > 0 else -1
             in_tolerance = abs(x_error) < CENTER_TOLERANCE_PX
-            tolerance_streak = tolerance_streak + 1 if in_tolerance else 0
-            if tolerance_streak >= HOLD_FRAMES:
-                parked = True
+            drifted = abs(x_error) > RECALIBRATE_TOLERANCE_PX
 
-            speed = 0 if parked else clamp(DRIVE_GAIN * x_error * DRIVE_SIGN, -MAX_SPEED, MAX_SPEED)
+            if parked:
+                # Stay parked through small jitter, but a sustained drift - the car or the
+                # camera got bumped - should make it re-approach instead of sitting still
+                # forever. RECALIBRATE_TOLERANCE_PX is wider than CENTER_TOLERANCE_PX so this
+                # doesn't chatter right at the edge of the tolerance band.
+                drift_streak = drift_streak + 1 if drifted else 0
+                if drift_streak >= DRIFT_HOLD_FRAMES:
+                    parked = False
+                    tolerance_streak = 0
+                    drift_streak = 0
+            else:
+                tolerance_streak = tolerance_streak + 1 if in_tolerance else 0
+                if tolerance_streak >= HOLD_FRAMES:
+                    parked = True
+                    drift_streak = 0
+
+            speed = 0 if parked else pid_speed(x_error)
             car.send(speed, now)
-
-        if now - last_seen > LOST_TIMEOUT:
-            car.send(0, now)
+        elif now - last_seen <= LOST_TIMEOUT:
+            # Tag not found this single frame - at MAX_SPEED/DRIVE_GAIN tuned low enough for the
+            # webcam's framerate, this should be rare and momentary, not sustained motion blur.
+            # Deliberately don't touch the motors here: stopping on every one-frame blip is the
+            # stop-start jitter we're trying to avoid, so the car keeps coasting at its last
+            # commanded speed until either the tag reappears or LOST_TIMEOUT gives up on it.
+            pass
+        else:
+            # Genuinely lost (past LOST_TIMEOUT, not just a blurred frame) - reset parking state
+            # so a fresh approach starts clean once the tag is found again.
             parked = False
             tolerance_streak = 0
+            drift_streak = 0
 
-        status = "PARKED" if parked else ("TRACKING" if target_corners is not None else "NO TAG")
+            if ever_seen:
+                # Failsafe: the tag was on-screen before and is gone now, most likely because
+                # the car drove it out of frame. Sweep slowly back and forth (continuing the
+                # direction it was last heading, then reversing every SEARCH_LEG_SECONDS) to
+                # scan the desk for it, instead of just sitting stopped and hoping.
+                if not searching:
+                    searching = True
+                    search_dir = last_direction
+                    search_leg_start = now
+                elif now - search_leg_start > SEARCH_LEG_SECONDS:
+                    search_dir *= -1
+                    search_leg_start = now
+                car.send(SEARCH_SPEED * search_dir * DRIVE_SIGN, now)
+            else:
+                car.send(0, now)
+
+        if target_corners is not None:
+            status = "PARKED" if parked else "TRACKING"
+        elif searching:
+            status = "SEARCHING"
+        else:
+            status = "NO TAG"
         cv2.putText(frame, status, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
 
         cv2.imshow("Autopark - press q to quit", frame)
