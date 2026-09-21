@@ -25,7 +25,7 @@ import numpy as np
 
 from lelib import doubleMotor
 
-CARD_SERIAL = "0999"                       # same Double Motor as autopark.py
+CARD_SERIAL = "1130"                       # same Double Motor as autopark.py
 TAG_FAMILY = cv2.aruco.DICT_APRILTAG_36h11
 TARGET_TAG_ID = 14
 
@@ -37,10 +37,13 @@ LEFT_FLIP = 1
 # backward" depends on which end of the car is facing which way once it's
 # set down broadside to the tag - flip this to -1 if the car drives away
 # from center instead of toward it.
-DRIVE_SIGN = 1
+DRIVE_SIGN = -1
 
-MAX_SPEED = 50          # -100..100, kept modest for a maneuver that ends close to the tag
-DRIVE_GAIN = 0.25       # motor-speed units per pixel of horizontal offset
+MAX_SPEED = 25          # -100..100, kept modest for a maneuver that ends close to the tag
+DRIVE_GAIN = 0.12       # motor-speed units per pixel of horizontal offset - lower than
+                        # autopark.py's because detection runs on the cropped corner
+                        # (~32% of frame width), so the same real-world offset covers far
+                        # fewer pixels and would otherwise saturate almost immediately
 
 CENTER_TOLERANCE_PX = 20
 HOLD_FRAMES = 5          # consecutive in-tolerance frames before declaring parked
@@ -48,6 +51,23 @@ LOST_TIMEOUT = 1.5       # seconds with no tag seen before the car is stopped as
 SEND_INTERVAL = 0.1      # BLE write throttle
 
 MAX_CONSECUTIVE_READ_FAILURES = 30     # ~1s of dropped frames over Wi-Fi before giving up
+
+# IP Camera Lite has no setting to disable its front-camera picture-in-picture
+# overlay, and the rest of the main frame has UI chrome (buttons, status text)
+# drawn over it - only the small upper-right corner is a clean, uncluttered
+# camera image. So instead of using the full frame, we crop down to just that
+# corner and treat it as the whole working feed (display + detection both use
+# it) - smaller, but the only part that's actually pure. As fractions of the
+# original frame's width/height; tune these against what's shown on screen.
+CROP_WIDTH_FRAC = 0.32
+CROP_HEIGHT_FRAC = 0.32
+
+# Nudges the crop window inward from the top-right corner, as fractions of
+# frame width/height, in case the clean corner image doesn't sit flush against
+# the edges. OFFSET_X shifts it left (away from the right edge), OFFSET_Y
+# shifts it down (away from the top edge).
+CROP_OFFSET_X_FRAC = 0.04
+CROP_OFFSET_Y_FRAC = 0.04
 
 
 def clamp(v, lo, hi):
@@ -81,8 +101,16 @@ class ParkMotor:
         if now - self._last_send > SEND_INTERVAL and speed != self._last_cmd:
             self.dm.set_speed_left(LEFT_FLIP * speed)
             self.dm.set_speed_right(RIGHT_FLIP * speed)
-            self.dm.run_left()
-            self.dm.run_right()
+            # run_left/run_right issue a "start moving" command - only needed when
+            # coming from a stop or reversing direction, not on every speed tweak.
+            # Resending them every time was adding 2 extra blocking BLE writes per
+            # send, which is what was stalling the video loop once tracking started.
+            starting = (self._last_cmd is None
+                        or (self._last_cmd == 0) != (speed == 0)
+                        or (self._last_cmd > 0) != (speed > 0))
+            if starting:
+                self.dm.run_left()
+                self.dm.run_right()
             self._last_send, self._last_cmd = now, speed
 
     def stop(self):
@@ -121,6 +149,14 @@ try:
         consecutive_failures = 0
 
         now = time.time()
+        orig_h, orig_w, _ = frame.shape
+        crop_w = int(orig_w * CROP_WIDTH_FRAC)
+        crop_h = int(orig_h * CROP_HEIGHT_FRAC)
+        offset_x = int(orig_w * CROP_OFFSET_X_FRAC)
+        offset_y = int(orig_h * CROP_OFFSET_Y_FRAC)
+        x_end = orig_w - offset_x
+        y_start = offset_y
+        frame = frame[y_start:y_start + crop_h, x_end - crop_w:x_end]
         h, w, _ = frame.shape
         center_x = w / 2
 

@@ -69,3 +69,73 @@ the control loop.
 
 See [CLAUDE.md](CLAUDE.md) for the constants, tuning knobs, and known
 limitations of this approach.
+
+## iPhone camera mode
+
+An alternate setup that inverts which end carries the camera vs. the tag:
+the AprilTag stays fixed somewhere in the room, and an iPhone - mounted on
+the car, broadside to the tag, same geometry as above - is the moving
+camera. Two scripts cover this:
+
+- `iphone_tracking.py` - perception only. Detects and draws the tag from
+  the iPhone's stream; no motor control. Useful for checking the camera
+  setup on its own before wiring up the car.
+- `iphone_autopark.py` - the full closed loop, same control logic as
+  `autopark.py` (same proportional control / tolerance-latch / lost-tag
+  failsafe), just reading frames from the iPhone instead of a local webcam.
+
+### Getting the iPhone's video feed
+
+No Mac is required. Install **IP Camera Lite** (free, App Store) on the
+iPhone, open its **Server** section, and turn on the IP Camera Server. It
+lists several stream URLs - use the **MJPEG** one, e.g.:
+
+```
+http://<phone-ip>:8081/video
+```
+
+If it prompts for a username/password, the app's default is `admin`/`admin`
+unless changed; embed credentials directly in the URL:
+
+```
+http://admin:admin@<phone-ip>:8081/video
+```
+
+Both scripts prompt for this URL at startup, the same way `autopark.py`
+prompts for a camera index.
+
+`.local` hostnames shown in the app (e.g. `dans-iphone.local`) often don't
+resolve through OpenCV's ffmpeg backend even when a browser can load them
+fine - use the phone's plain IP address instead (Settings > Wi-Fi > tap the
+ⓘ next to your network) if the hostname fails.
+
+### The picture-in-picture workaround
+
+IP Camera Lite has no setting to broadcast the back camera alone - its
+stream is the full on-screen composite: back camera as the main image,
+front camera as a small picture-in-picture overlay in one corner, plus UI
+chrome (buttons, status text) drawn over the rest. Since the corner overlay
+is the only clean, uncluttered image, `iphone_autopark.py` crops down to
+just that corner and uses it as the entire working feed - display and
+detection both run on the crop, not the full frame. `CROP_WIDTH_FRAC` /
+`CROP_HEIGHT_FRAC` and `CROP_OFFSET_X_FRAC` / `CROP_OFFSET_Y_FRAC` at the
+top of the file control the crop's size and position - tune them against
+what's shown in the display window until it lines up exactly.
+
+Because detection runs on a much smaller image than `autopark.py`'s full
+frame, `iphone_autopark.py` uses a lower `DRIVE_GAIN`/`MAX_SPEED` - the same
+real-world offset covers far fewer pixels in the cropped view, so
+`autopark.py`'s original gain would saturate to full speed almost
+immediately.
+
+### Known issues
+
+- Frame rate visibly drops once the tag is detected and the car starts
+  moving, since BLE motor commands block the video loop while they're sent.
+  Only reissuing `run_left`/`run_right` (which actually start the motor) on
+  a stop/direction change rather than on every speed adjustment helps, but
+  some slowdown remains.
+- Streaming over Wi-Fi occasionally drops frames; both iPhone scripts
+  tolerate a run of failed reads (`MAX_CONSECUTIVE_READ_FAILURES`) before
+  giving up, unlike `autopark.py`'s wired webcam, which treats any failed
+  read as fatal.
