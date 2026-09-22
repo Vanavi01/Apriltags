@@ -62,6 +62,14 @@ frames, it's declared `PARKED` and the motors are held at zero. If the tag
 isn't seen for `LOST_TIMEOUT` (1.5s), the car stops as a failsafe, mirroring
 the lost-hands failsafe in ceciLego's `drive.py`.
 
+A new speed is only sent on frames where the tag is actually detected - a
+frame with no detection doesn't send anything, so the car just keeps running
+its last commanded speed rather than stopping. This is deliberate tolerance
+for an occasional bad detection frame (motion blur, a momentary miss), not
+latency compensation. `LOST_TIMEOUT` is the real safety net: it only kicks in
+once the tag has been genuinely absent for 1.5s straight, not just missing
+from a single frame.
+
 The tag's apparent size in pixels is still shown on screen next to its
 centroid, but it's informational only - the car has no way to correct its
 distance from the webcam by driving along this line, so size isn't part of

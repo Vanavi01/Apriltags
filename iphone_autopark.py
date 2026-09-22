@@ -1,5 +1,5 @@
 '''
-iPhone autopark: same closed-loop parking control as autopark.py, but reads
+iPhone autopark: same closed-loop parking setup as autopark.py, but reads
 frames from an iPhone's MJPEG stream (IP Camera Lite) instead of a local
 webcam - the car drives itself using a fixed AprilTag (tag36h11, ID 14) as
 its landmark instead of carrying the tag itself.
@@ -7,10 +7,12 @@ its landmark instead of carrying the tag itself.
 The tag is stationary somewhere in the room; the iPhone is mounted on the
 car, broadside to the tag, same physical relationship autopark.py relies on
 (the car's drive axis parallel to the tag's line of sight) - only which end
-carries the camera and which carries the tag is swapped. That means the
-control math is identical: the car can't turn, so the only thing driving
-forward/backward changes is the tag's horizontal position in frame, and
-that's the only feedback signal needed.
+carries the camera and which carries the tag is swapped. That means the car
+still can't turn and the only feedback signal is the tag's horizontal
+position in frame - but unlike autopark.py's pure-P controller, this one is
+PD: it also reacts to how fast that horizontal offset is changing, to damp
+the overshoot/oscillation that motor lag and the car's momentum would
+otherwise cause as it approaches center.
 
 Usage:
     python iphone_autopark.py
@@ -40,10 +42,17 @@ LEFT_FLIP = 1
 DRIVE_SIGN = -1
 
 MAX_SPEED = 25          # -100..100, kept modest for a maneuver that ends close to the tag
-DRIVE_GAIN = 0.12       # motor-speed units per pixel of horizontal offset - lower than
+KP_GAIN = 0.12          # motor-speed units per pixel of horizontal offset - lower than
                         # autopark.py's because detection runs on the cropped corner
                         # (~32% of frame width), so the same real-world offset covers far
                         # fewer pixels and would otherwise saturate almost immediately
+KD_GAIN = 0.02          # motor-speed units per (pixel/second) of offset rate of change -
+                        # starting placeholder, tune empirically like KP_GAIN/DRIVE_SIGN:
+                        # raise it if the car oscillates around center, lower it if it's
+                        # sluggish to stop
+D_SMOOTHING_ALPHA = 0.3  # EMA weight on the raw per-frame derivative (0 = fully smoothed/
+                         # laggy, 1 = unsmoothed/noisy) - damps jitter from frame-to-frame
+                         # detection noise so it doesn't turn into a jerky speed signal
 
 CENTER_TOLERANCE_PX = 20
 HOLD_FRAMES = 5          # consecutive in-tolerance frames before declaring parked
@@ -133,6 +142,9 @@ last_seen = time.time()
 tolerance_streak = 0
 parked = False
 consecutive_failures = 0
+prev_error = None
+prev_time = None
+smoothed_d = 0.0
 
 try:
     while True:
@@ -183,18 +195,30 @@ try:
 
             x_error = centroid[0] - center_x
 
+            if prev_error is not None and prev_time is not None and now > prev_time:
+                raw_d = (x_error - prev_error) / (now - prev_time)
+                smoothed_d = D_SMOOTHING_ALPHA * raw_d + (1 - D_SMOOTHING_ALPHA) * smoothed_d
+            else:
+                smoothed_d = 0.0
+            prev_error, prev_time = x_error, now
+
             in_tolerance = abs(x_error) < CENTER_TOLERANCE_PX
             tolerance_streak = tolerance_streak + 1 if in_tolerance else 0
             if tolerance_streak >= HOLD_FRAMES:
                 parked = True
 
-            speed = 0 if parked else clamp(DRIVE_GAIN * x_error * DRIVE_SIGN, -MAX_SPEED, MAX_SPEED)
+            speed = 0 if parked else clamp(
+                DRIVE_SIGN * (KP_GAIN * x_error + KD_GAIN * smoothed_d), -MAX_SPEED, MAX_SPEED
+            )
             car.send(speed, now)
 
         if now - last_seen > LOST_TIMEOUT:
             car.send(0, now)
             parked = False
             tolerance_streak = 0
+            prev_error = None
+            prev_time = None
+            smoothed_d = 0.0
 
         status = "PARKED" if parked else ("TRACKING" if target_corners is not None else "NO TAG")
         cv2.putText(frame, status, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
