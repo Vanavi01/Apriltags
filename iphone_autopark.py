@@ -54,8 +54,10 @@ D_SMOOTHING_ALPHA = 0.3  # EMA weight on the raw per-frame derivative (0 = fully
                          # laggy, 1 = unsmoothed/noisy) - damps jitter from frame-to-frame
                          # detection noise so it doesn't turn into a jerky speed signal
 
-CENTER_TOLERANCE_PX = 20
-HOLD_FRAMES = 5          # consecutive in-tolerance frames before declaring parked
+CENTER_TOLERANCE_PX = 20  # dead-band: offsets smaller than this are fed to the controller
+                          # as 0 error, so the car holds still instead of hunting/jittering
+                          # right at center - it does NOT latch or stop tracking, the loop
+                          # keeps re-centering every frame if the tag drifts back out
 LOST_TIMEOUT = 1.5       # seconds with no tag seen before the car is stopped as a failsafe
 SEND_INTERVAL = 0.1      # BLE write throttle
 
@@ -139,12 +141,11 @@ car = ParkMotor(CARD_SERIAL)
 car.connect()
 
 last_seen = time.time()
-tolerance_streak = 0
-parked = False
 consecutive_failures = 0
 prev_error = None
 prev_time = None
 smoothed_d = 0.0
+in_tolerance = False
 
 try:
     while True:
@@ -203,24 +204,21 @@ try:
             prev_error, prev_time = x_error, now
 
             in_tolerance = abs(x_error) < CENTER_TOLERANCE_PX
-            tolerance_streak = tolerance_streak + 1 if in_tolerance else 0
-            if tolerance_streak >= HOLD_FRAMES:
-                parked = True
+            feedback_error = 0.0 if in_tolerance else x_error
 
-            speed = 0 if parked else clamp(
-                DRIVE_SIGN * (KP_GAIN * x_error + KD_GAIN * smoothed_d), -MAX_SPEED, MAX_SPEED
+            speed = clamp(
+                DRIVE_SIGN * (KP_GAIN * feedback_error + KD_GAIN * smoothed_d), -MAX_SPEED, MAX_SPEED
             )
             car.send(speed, now)
 
         if now - last_seen > LOST_TIMEOUT:
             car.send(0, now)
-            parked = False
-            tolerance_streak = 0
+            in_tolerance = False
             prev_error = None
             prev_time = None
             smoothed_d = 0.0
 
-        status = "PARKED" if parked else ("TRACKING" if target_corners is not None else "NO TAG")
+        status = "PARKED" if in_tolerance else ("TRACKING" if target_corners is not None else "NO TAG")
         cv2.putText(frame, status, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
 
         cv2.imshow("iPhone autopark - press q to quit", frame)
